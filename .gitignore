@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+browser-audio-*.srt
+browser-audio-*.mp4
+*.log
