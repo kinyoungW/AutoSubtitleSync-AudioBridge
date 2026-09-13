@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoSubtitleSync · Browser Audio Bridge
 // @namespace    autosubtitlesync.local
-// @version      3.0.1
+// @version      3.0.2
 // @description  把正在播放的声音送给你自己电脑上的 AutoSubtitleSync 做实时字幕。三种抓音方式：播放器元素 / 共享标签页音频 / 系统声音；支持跨框架 & 影子播放器探测
 // @author       AutoSubtitleSync
 // @match        *://*/*
@@ -82,11 +82,11 @@
       server = null;                       // 缓存到的是旧版本程序，重新扫描
     }
     // 并行探测端口范围；如果有多个程序在跑（新旧同时开着），优先选版本最新的那个
-    var probed = await Promise.all(PORTS.map(function (p) {
-      return req('GET', 'http://127.0.0.1:' + p + '/api/companion/ping', null, 900)
+    var probed = await withDeadline(Promise.all(PORTS.map(function (p) {
+      return withDeadline(req('GET', 'http://127.0.0.1:' + p + '/api/companion/ping', null, 900)
         .then(function (x) { return (x && x.app === 'AutoSubtitleSync') ? { port: p, version: String(x.version || '') } : null; })
-        .catch(function () { return null; });
-    }));
+        .catch(function () { return null; }), 1100, null);
+    })), 2600, []);
     var list = probed.filter(function (x) { return !!x; });
     if (!list.length) return null;
     list.sort(function (a, b) {
@@ -134,6 +134,12 @@
   }
 
   function setToast(t) { toast = t || ''; }
+
+  // 有些情况下 GM_xmlhttpRequest 一个回调都不会触发（被浏览器/网络挡掉时），
+  // 只靠它自己的 timeout 会让 await 永远悬着——所有网络动作都用这个包一层硬超时。
+  function withDeadline(p, ms, fallback) {
+    return Promise.race([p, new Promise(function (r) { setTimeout(function () { r(fallback); }, ms); })]);
+  }
 
   // ------------------------------------------------------------------ 消息层
   function post(msg) { try { window.top.postMessage(Object.assign({ __as: MSG }, msg), '*'); } catch (e) { } }
@@ -368,7 +374,8 @@
     if (running || starting) return;
     starting = true; reportLines = []; pushReport('正在连接本机服务…');
     try {
-      if (!(await findServer())) throw new Error('没有找到本机服务：请先双击运行 AutoSubtitleSync 的启动程序，并保持窗口开着。');
+      var srv = await withDeadline(findServer(), 6000, null);
+      if (!srv) throw new Error('没有找到本机服务（已扫描端口 8765–8785，都没有响应）。\n请确认：① v8.2 的程序正在运行、窗口第一行写着「v8.2」；② 它没被浏览器拦住——点「测试本机连接」可以看到详细结果。');
       if (source === 'tab') await startTab(p);
       else if (source === 'system') await startSystem(p);
       else {
@@ -697,6 +704,7 @@
       '<button class="primary" id="start">开始实时字幕</button>' +
       '<button class="stop hidden" id="stop">停止</button>' +
       '<button class="secondary" id="open-ui">打开本机控制台</button>' +
+      '<button class="secondary" id="testconn">测试本机连接</button>' +
       '<button class="secondary" id="probe">测试影子播放器（可选）</button>' +
       '<pre class="report hidden" id="probeOut"></pre>' +
       '<button class="secondary hidden" id="copyProbe">复制报告</button>' +
@@ -721,6 +729,7 @@
       if (!s) { setMsg('没有找到本机服务：请先运行 AutoSubtitleSync 启动程序。', true); return; }
       window.open('http://127.0.0.1:' + s.port + '/', '_blank', 'noopener');
     });
+    $('testconn').addEventListener('click', function () { testConnection(); });
     $('probe').addEventListener('click', function () { if (!probeBusy) probeTop(); });
     copyProbeBtn.addEventListener('click', async function () {
       try { await navigator.clipboard.writeText(reportLines.join('\n')); copyProbeBtn.textContent = '已复制 ✓'; setTimeout(function () { copyProbeBtn.textContent = '复制报告'; }, 1500); }
@@ -760,6 +769,39 @@
     if (pick) postTo(pick.win, { kind: 'stop' });
     await stop(false);
     setMsg('已停止。', false);
+  }
+
+  async function testConnection() {
+    reportLines = []; showReport(true);
+    pushReport('本机连接测试 · ' + new Date().toLocaleString());
+    pushReport('正在扫描端口 8765–8785 …');
+    var hits = [];
+    await withDeadline(Promise.all(PORTS.map(function (p) {
+      return withDeadline(req('GET', 'http://127.0.0.1:' + p + '/api/companion/ping', null, 900)
+        .then(function (x) {
+          if (x && x.app === 'AutoSubtitleSync') {
+            var v = String(x.version || '?');
+            hits.push('  ✓ 端口 ' + p + ' → 程序 v' + v + (/^8\./.test(v) ? '' : '   ← 旧版本，没有音频桥接口'));
+          }
+        })
+        .catch(function () { }), 1100, null);
+    })), 3000, []);
+    if (!hits.length) {
+      pushReport('✗ 一个端口都没有响应：本机程序没有在运行。');
+      pushReport('  请到 v8.2 文件夹双击「AutoSubtitleSync.command」，等窗口第一行出现 v8.2 字样。');
+      pushReport('  （如果窗口已经开着却仍然没有响应，那多半是程序启动失败或还在装依赖，把窗口内容发我。）');
+    } else {
+      hits.forEach(function (l) { pushReport(l); });
+      server = null;
+      var srv = await withDeadline(findServer(), 4000, null);
+      var v2 = srv ? String(srv.version || '') : '';
+      if (v2 && /^8\./.test(v2)) {
+        pushReport('结论：✓ 找到可用的本机程序 v' + v2 + '（端口 ' + srv.port + '），音频桥可用。');
+      } else {
+        pushReport('结论：只找到了旧版本程序 v' + v2 + '，它没有音频桥接口。');
+        pushReport('  请关掉这些旧窗口，改用 v8.2 文件夹里的「AutoSubtitleSync.command」启动。');
+      }
+    }
   }
 
   async function probeTop() {
