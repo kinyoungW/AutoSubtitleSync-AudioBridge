@@ -17,7 +17,7 @@ Decoding strategy — disjoint windows (no overlap):
 Timeline: cue times are absolute player times. The browser reports `t0` (the
 player's currentTime when capture started); audio offset = bytes / 32000.
 """
-import re, threading, time
+import queue, re, subprocess, sys, threading, time
 import numpy as np
 
 from browser_audio_bridge import pop_pcm, reset_stats, snapshot as audio_stats
@@ -46,12 +46,153 @@ def _drain():
             return
 
 
-def start_audio_session(opt):
-    """Start a live caption session fed by browser PCM chunks."""
-    srv = _srv()
-    global _worker
-    stop_audio_session(quiet=True)
+# ---------------------------------------------------------------- PCM 音源
+class BridgeSource:
+    """PCM 来自浏览器音频桥（页面推送到 /api/browser-audio/push 的队列）。"""
+    label = "浏览器音频"
+    kind = "browser"
 
+    def read(self, timeout=0.4):
+        return pop_pcm(timeout=timeout)
+
+    def close(self):
+        pass
+
+
+class PipeSource:
+    """PCM 来自 ffmpeg 管道（系统声音 / 虚拟声卡 / 任意音频输入）。"""
+    kind = "pipe"
+
+    def __init__(self, cmd, label="系统声音", read_size=32768):
+        self.cmd = list(cmd)
+        self.label = label
+        self.read_size = read_size
+        self.proc = None
+        self._q = queue.Queue(maxsize=80)
+        self._eof = False
+        self._err = []
+        self.dropped = 0
+
+    def start(self):
+        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._drain_err, daemon=True).start()
+        return self
+
+    def _pump(self):
+        try:
+            while True:
+                block = self.proc.stdout.read(self.read_size)
+                if not block:
+                    break
+                try:
+                    self._q.put(block, timeout=2.0)
+                except Exception:
+                    try:
+                        self._q.get_nowait()          # 队列满：丢最旧块，保住"当前"
+                    except Exception:
+                        pass
+                    self.dropped += 1
+                    try:
+                        self._q.put_nowait(block)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            self._eof = True
+
+    def _drain_err(self):
+        try:
+            for raw in iter(self.proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    self._err.append(line)
+                    del self._err[:-20]
+        except Exception:
+            pass
+
+    def read(self, timeout=0.4):
+        try:
+            return self._q.get(timeout=timeout)
+        except Exception:
+            return b"" if self._eof else None      # b"" = 音源结束；None = 暂时没有数据
+
+    def error_text(self):
+        return " / ".join(self._err[-4:])
+
+    def close(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    self.proc.kill()
+        except Exception:
+            pass
+
+
+VIRTUAL_DEVICE_RE = re.compile(r"blackhole|loopback|soundflower|virtual|cable|aggregate|multi", re.I)
+
+
+def list_capture_devices():
+    """列出可用于「录电脑正在播放的声音」的音频输入设备。"""
+    srv = _srv()
+    if sys.platform != "darwin":
+        return {"devices": [], "recommended": None, "platform": sys.platform,
+                "hint": "自动列举音频设备目前只支持 macOS（avfoundation）。"}
+    try:
+        p = subprocess.run([srv.get_ffmpeg_exe(), "-hide_banner", "-f", "avfoundation",
+                            "-list_devices", "true", "-i", ""],
+                           capture_output=True, text=True, timeout=25)
+        text = (p.stderr or "") + (p.stdout or "")
+    except Exception as e:
+        return {"devices": [], "recommended": None, "platform": sys.platform, "hint": f"调用 ffmpeg 失败：{e}"}
+    devices, in_audio = [], False
+    for line in text.splitlines():
+        low = line.lower()
+        if "video devices" in low:
+            in_audio = False
+            continue
+        if "audio devices" in low:
+            in_audio = True
+            continue
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if m and in_audio:
+            devices.append({"index": int(m.group(1)), "name": m.group(2).strip()})
+    recommended = None
+    for d in devices:
+        if VIRTUAL_DEVICE_RE.search(d["name"]):
+            recommended = d["index"]
+            break
+    if not devices:
+        hint = "没有枚举到音频输入设备。请确认 ffmpeg 可用，并在「系统设置 → 隐私与安全性 → 麦克风」里允许终端 / 本程序。"
+    elif recommended is None:
+        hint = ("没有发现虚拟声卡。直接采麦克风只能录到环境声，听不到电脑播放的声音。"
+                "想录「电脑正在播放的声音」，先装免费的 BlackHole（brew install blackhole-2ch），"
+                "再到「音频 MIDI 设置」新建一个多输出设备（BlackHole + 你的扬声器）——"
+                "这样你自己还能照常听到声音。装好后再点一次。")
+    else:
+        hint = ""
+    return {"devices": devices, "recommended": recommended, "platform": sys.platform, "hint": hint}
+
+
+def _capture_cmd(device, extra_input=None):
+    ff = _srv().get_ffmpeg_exe()
+    if extra_input:
+        inp = list(extra_input)
+    elif sys.platform == "darwin":
+        inp = ["-f", "avfoundation", "-i", f":{int(device)}"]
+    elif sys.platform.startswith("linux"):
+        inp = ["-f", "pulse", "-i", str(device)]
+    else:
+        inp = ["-f", "dshow", "-i", f"audio={device}"]
+    return [ff, "-hide_banner", "-loglevel", "error"] + inp + \
+           ["-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"]
+
+
+def _norm_opts(opt):
     model = str(opt.get("model") or "small")
     if model not in {"tiny", "base", "small", "medium", "large-v3"}:
         model = "small"
@@ -61,14 +202,19 @@ def start_audio_session(opt):
     target = str(opt.get("target") or "zh")
     if target not in {"original", "zh", "en", "fr", "es", "de"}:
         target = "zh"
-    bilingual = bool(opt.get("bilingual", False))
-    mixed = bool(opt.get("mixed", True))
-    t0 = max(0.0, float(opt.get("t0", opt.get("current_time", 0)) or 0.0))
-    title = str(opt.get("title") or "浏览器音频")[:200]
-    url = str(opt.get("url") or "")
-    window_sec = max(3.0, min(20.0, float(opt.get("window", 6) or 6)))
-    tail = max(0.0, min(8.0, float(opt.get("tail", 1.5) or 1.5)))
+    return {"model": model, "lang": lang, "target": target,
+            "bilingual": bool(opt.get("bilingual", False)),
+            "mixed": bool(opt.get("mixed", True)),
+            "t0": max(0.0, float(opt.get("t0", opt.get("current_time", 0)) or 0.0)),
+            "title": str(opt.get("title") or "实时字幕")[:200],
+            "url": str(opt.get("url") or ""),
+            "window": max(3.0, min(20.0, float(opt.get("window", 6) or 6))),
+            "tail": max(0.0, min(8.0, float(opt.get("tail", 1.5) or 1.5)))}
 
+
+def _begin_session(o, source, session_mode, message):
+    srv = _srv()
+    global _worker
     srv.ONLINE_STOP.set()
     time.sleep(0.05)
     srv.ONLINE_STOP.clear()
@@ -76,29 +222,60 @@ def start_audio_session(opt):
         srv.ONLINE_CUES.clear()
         srv.ONLINE_RAW.clear()
         srv.ONLINE_REVISION = 0
-
     seq = int(srv.get_state().get("companion_seq") or 0) + 1
     srv.set_state(
-        companion_seq=seq, companion_received=True, companion_url=url, companion_title=title,
-        companion_start_time=t0,
-        online_running=True, online_audio_mode=True, online_url=url, online_title=title,
-        online_message="音频通道已连接，正在加载 Whisper…", online_error="", online_done=False,
-        online_count=0, online_revision=0, online_is_live=True, online_lookahead=tail,
-        online_processed_time=t0, online_stable_through=t0, online_start_at=t0,
+        companion_seq=seq, companion_received=True, companion_url=o["url"], companion_title=o["title"],
+        companion_start_time=o["t0"],
+        online_running=True, online_audio_mode=True, online_url=o["url"], online_title=o["title"],
+        online_message=message, online_error="", online_done=False,
+        online_count=0, online_revision=0, online_is_live=True, online_lookahead=o["tail"],
+        online_processed_time=o["t0"], online_stable_through=o["t0"], online_start_at=o["t0"],
         online_phase="BUFFERING", online_phase_label="建立实时字幕",
-        online_session_mode="browser_audio", online_session_browser="",
-        online_semantic_tail=tail, online_duration=0.0, online_player_url="",
+        online_session_mode=session_mode, online_session_browser="",
+        online_semantic_tail=o["tail"], online_duration=0.0, online_player_url="",
         online_error_kind="", online_error_hint="", online_resolve_attempts=[], error="",
-        browser_audio_dropped=0, browser_audio_stats={})
-    reset_stats()
-    _drain()
+        browser_audio_dropped=0, browser_audio_stats={}, online_source=source.label)
     _worker = threading.Thread(
         target=_audio_worker,
-        args=(t0, model, lang, mixed, target, bilingual, window_sec, tail),
+        args=(o["t0"], o["model"], o["lang"], o["mixed"], o["target"], o["bilingual"], o["window"], o["tail"], source),
         daemon=True)
     _worker.start()
-    return {"ok": True, "seq": seq, "audio_mode": True, "start_at": t0,
-            "window": window_sec, "step": window_sec, "tail": tail}
+    return {"ok": True, "seq": seq, "audio_mode": True, "start_at": o["t0"], "window": o["window"],
+            "step": o["window"], "tail": o["tail"], "source": source.label}
+
+
+def start_audio_session(opt):
+    """浏览器音频桥：PCM 由网页推送到 /api/browser-audio/push。"""
+    stop_audio_session(quiet=True)
+    o = _norm_opts(opt)
+    reset_stats()
+    _drain()
+    return _begin_session(o, BridgeSource(), "browser_audio", "音频通道已连接，正在加载 Whisper…")
+
+
+def start_system_audio(opt):
+    """系统声音：服务端用 ffmpeg 直接从音频输入设备录音（配虚拟声卡可录电脑播放的声音）。"""
+    stop_audio_session(quiet=True)
+    o = _norm_opts(opt)
+    device = opt.get("device")
+    extra = opt.get("input_args")
+    if not extra:
+        info = list_capture_devices()
+        if device is None:
+            device = info.get("recommended")
+        if device is None:
+            if not info.get("devices"):
+                raise RuntimeError(info.get("hint") or "没有可用的音频输入设备。")
+            device = info["devices"][0]["index"]
+    cmd = _capture_cmd(device, extra)
+    src = PipeSource(cmd, label="系统声音").start()
+    time.sleep(0.6)
+    if src.proc.poll() is not None:
+        err = src.error_text()
+        rc = src.proc.returncode
+        src.close()
+        raise RuntimeError(f"无法采集系统声音（ffmpeg 退出码 {rc}）：{err or '设备不可用或没有权限'}")
+    return _begin_session(o, src, "system_audio", f"系统声音采集中（设备 {device}），正在加载 Whisper…")
 
 
 def stop_audio_session(quiet=False):
@@ -212,7 +389,8 @@ def _append_raw(segs, window_start, srv, commit_until=None):
     return added
 
 
-def _audio_worker(t0, model_size, lang, mixed, target, bilingual, window_sec, tail):
+def _audio_worker(t0, model_size, lang, mixed, target, bilingual, window_sec, tail, source=None):
+    source = source or BridgeSource()
     srv = _srv()
     fallback = "en"
     buf = bytearray()
@@ -228,7 +406,9 @@ def _audio_worker(t0, model_size, lang, mixed, target, bilingual, window_sec, ta
             online_phase="READY", online_phase_label="实时识别中")
 
         while not srv.ONLINE_STOP.is_set():
-            chunk = pop_pcm(timeout=0.4)
+            chunk = source.read(timeout=0.4)
+            if chunk == b"":
+                break                       # 音源结束（ffmpeg 退出 / 设备断开）
             if chunk:
                 buf.extend(chunk)
                 last_data = time.time()
@@ -279,9 +459,12 @@ def _audio_worker(t0, model_size, lang, mixed, target, bilingual, window_sec, ta
                     online_message=f"实时字幕运行中 · 静音中 · 已处理 {processed/60:.1f} 分钟")
 
             srv._rebuild_semantic_cues(fallback, target, bilingual, processed, tail)
-            stats = audio_stats()
+            if getattr(source, "kind", "") == "browser":
+                stats = audio_stats()
+            else:
+                stats = {"queue": 0, "dropped": getattr(source, "dropped", 0), "kind": getattr(source, "kind", "")}
             srv.set_state(online_processed_time=processed, online_is_live=True,
-                          browser_audio_dropped=stats.get('dropped', 0), browser_audio_stats=stats)
+                          browser_audio_dropped=stats.get("dropped", 0), browser_audio_stats=stats)
 
             keep_back = int(return_sec * BYTES_PER_SEC)
             drop = max(0, cut - keep_back)
@@ -329,3 +512,8 @@ def _audio_worker(t0, model_size, lang, mixed, target, bilingual, window_sec, ta
         srv.set_state(online_running=False, online_done=False, online_error=str(e),
                       online_phase="ERROR", online_phase_label="音频字幕失败",
                       online_message="音频字幕失败", error=str(e))
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass

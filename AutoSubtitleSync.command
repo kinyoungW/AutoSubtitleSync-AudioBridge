@@ -3,7 +3,7 @@ set -u
 SCRIPT_DIR="${0:A:h}"
 cd "$SCRIPT_DIR" || exit 1
 
-printf '\n=== Auto Subtitle Sync v8.1 Audio Bridge ===\n'
+printf '\n=== Auto Subtitle Sync v8.2 Audio Bridge ===\n'
 printf 'macOS 本地字幕生成 / 翻译 / 校准 / MP4 封装\n\n'
 
 if [[ ! -x ".venv/bin/python" ]]; then
