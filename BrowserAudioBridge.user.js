@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AutoSubtitleSync · Browser Audio Bridge
 // @namespace    autosubtitlesync.local
-// @version      2.0.0
-// @description  直接从网页播放器抓音频（不解析链接、不下载视频），推给本机 AutoSubtitleSync 生成实时字幕并叠加在画面上
+// @version      2.1.0
+// @description  直接从网页播放器抓音频（不解析链接、不下载视频），推给本机 AutoSubtitleSync 生成实时字幕并叠加在画面上；带"影子播放器"可行性探测
 // @author       AutoSubtitleSync
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -264,6 +264,7 @@
 
   // ---------------------------------------------------------------- 字幕条
   let overlayHost = null, overlayRoot = null, capEl = null, hudEl = null;
+  let probeOut = null, copyProbeBtn = null, probeBusy = false;
   function ensureOverlay() {
     if (overlayHost && overlayHost.isConnected) return;
     overlayHost = document.createElement('div');
@@ -336,7 +337,9 @@
       .primary{background:#2563eb;color:#fff}.secondary{background:#f1f3f6;color:#252a33}.stop{background:#fff0ee;color:#b42318}
       .primary:disabled{opacity:.5}.msg{font-size:11px;color:#6b7280;line-height:1.55;margin-top:9px}.msg.err{color:#b42318}
       .stats{margin-top:10px;padding:9px 10px;border-radius:10px;background:#f7f8fa;border:1px solid #e9ebef;font-size:11px;color:#505866;line-height:1.55;font-variant-numeric:tabular-nums}
-      .hidden{display:none!important}</style>
+      .hidden{display:none!important}
+      .report{max-height:210px;overflow:auto;background:#0b1220;color:#d7e3f4;border-radius:10px;padding:10px;font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;word-break:break-all;margin-top:9px}
+      .hint{font-size:10.5px;color:#8a93a3;line-height:1.5;margin-top:7px}</style>
       <button class="pill" id="pill"><span class="dot" id="dot"></span><span id="pillText">实时字幕（音频桥）</span></button>
       <div class="panel" id="panel">
         <div class="title">AutoSubtitleSync · 浏览器音频桥</div>
@@ -355,13 +358,17 @@
         <button class="primary" id="start">开始实时字幕</button>
         <button class="stop hidden" id="stop">停止</button>
         <button class="secondary" id="open-ui">打开本机控制台</button>
+        <button class="secondary" id="probe">测试影子播放器（可选）</button>
+        <pre class="report hidden" id="probeOut"></pre>
+        <button class="secondary hidden" id="copyProbe">复制报告</button>
+        <div class="hint">「影子播放器」是给字幕加前瞻用的：同一页面里克隆一个静音播放器，提前 60 秒播放同一段视频，让识别拿到"未来"的声音，断句就能像导入字幕那样自然。不是所有网站都允许（blob:/DRM 的通常不行）——点上面的按钮实测，把报告发给我。</div>
         <div class="stats hidden" id="stats"></div>
         <div class="msg" id="msg">第一次用：先双击运行 AutoSubtitleSync 启动程序，等它显示"已启动"，再点上面的按钮。</div>
       </div>`;
     document.documentElement.appendChild(host);
     panelRoot = sh;
     const $ = id => sh.getElementById(id);
-    msgEl = $('msg'); pillDot = $('dot'); pillText = $('pillText'); startBtn = $('start'); stopBtn = $('stop'); statsEl = $('stats');
+    msgEl = $('msg'); pillDot = $('dot'); pillText = $('pillText'); startBtn = $('start'); stopBtn = $('stop'); statsEl = $('stats'); probeOut = $('probeOut'); copyProbeBtn = $('copyProbe');
     const saved = loadPrefs();
     $('model').value = saved.model; $('target').value = saved.target; $('win').value = String(saved.window);
     $('lang').value = saved.lang; $('bilingual').checked = !!saved.bilingual;
@@ -369,6 +376,11 @@
     $('pill').addEventListener('click', () => $('panel').classList.toggle('open'));
     startBtn.addEventListener('click', start);
     stopBtn.addEventListener('click', () => stop(false));
+    $('probe').addEventListener('click', () => { if (!probeBusy) probeShadow(); });
+    copyProbeBtn.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(probeOut.textContent || ''); copyProbeBtn.textContent = '已复制 ✓'; setTimeout(() => copyProbeBtn.textContent = '复制报告', 1500); }
+      catch (e) { setMsg('复制失败，请手动选中报告文字复制。', true); }
+    });
     $('open-ui').addEventListener('click', async () => {
       const s = server || await findServer();
       if (!s) { setMsg('没有找到本机服务：请先运行 AutoSubtitleSync 启动程序。', true); return; }
@@ -401,6 +413,168 @@
       const secs = (Date.now() - startedAt) / 1000;
       statsEl.innerHTML = `已送入声音：<b>${(pushedBytes / 32000).toFixed(1)} 秒</b>（播放了 ${secs.toFixed(0)} 秒）<br>已识别字幕：<b>${cues.length} 条</b>${dropped ? `<br>丢弃的音频块：<b>${dropped}</b>（电脑处理不过来时会丢）` : ''}`;
     }
+  }
+
+  // ---------------------------------------------------------------- 影子播放器探测
+  function waitFor(fn, ms, step) {
+    return new Promise(resolve => {
+      const t0 = Date.now();
+      const tick = () => {
+        let r = false;
+        try { r = fn(); } catch (e) { r = false; }
+        if (r) return resolve(true);
+        if (Date.now() - t0 > ms) return resolve(false);
+        setTimeout(tick, step || 200);
+      };
+      tick();
+    });
+  }
+
+  function measureStream(v, ms) {
+    // 抓 v 的声音 ms 毫秒，返回有效响度（用来自动判断"抓得到 / 抓不到声音"）
+    return new Promise(async resolve => {
+      let ac = null, stream = null, node = null, gain = null, src = null;
+      let sum = 0, n = 0, peak = 0, frames = 0;
+      try {
+        stream = v.captureStream ? v.captureStream() : (v.mozCaptureStream ? v.mozCaptureStream() : null);
+        if (!stream || !stream.getAudioTracks().length) return resolve({ ok: false, rms: 0, reason: '没有音轨 / 不支持 captureStream' });
+        ac = new (window.AudioContext || window.webkitAudioContext)();
+        try { await ac.resume(); } catch (e) { }
+        src = ac.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+        gain = ac.createGain(); gain.gain.value = 0;          // 静音：探测时不会外放
+        node = ac.createScriptProcessor(4096, 1, 1);
+        node.onaudioprocess = e => {
+          const d = e.inputBuffer.getChannelData(0);
+          for (let i = 0; i < d.length; i++) { const x = d[i]; sum += x * x; const a = x < 0 ? -x : x; if (a > peak) peak = a; n++; }
+          frames++;
+        };
+        src.connect(node); node.connect(gain); gain.connect(ac.destination);
+      } catch (e) {
+        try { if (ac) ac.close(); } catch (e2) { }
+        return resolve({ ok: false, rms: 0, reason: e.message || String(e) });
+      }
+      setTimeout(() => {
+        const rms = n ? Math.sqrt(sum / n) : 0;
+        try { node.disconnect(); src.disconnect(); gain.disconnect(); } catch (e) { }
+        try { stream.getTracks().forEach(t => t.stop()); } catch (e) { }
+        try { ac.close(); } catch (e) { }
+        resolve({ ok: rms > 0.0008, rms, peak, frames });
+      }, ms);
+    });
+  }
+
+  async function probeShadow() {
+    probeBusy = true;
+    const out = [];
+    const say = t => { out.push(t); probeOut.textContent = out.join('\n'); };
+    probeOut.classList.remove('hidden'); copyProbeBtn.classList.remove('hidden');
+    probeOut.textContent = '正在探测，请保持视频播放（约 12 秒）…';
+    out.length = 0;
+    const LEAD = 60;
+    say('AutoSubtitleSync 影子播放器探测报告');
+    say('时间：' + new Date().toLocaleString());
+    say('页面：' + location.hostname + location.pathname.slice(0, 70));
+    const v = mainVideo();
+    if (!v) { say('✗ 没找到正在播放的播放器——请先点开视频播放几秒再点这个按钮。'); probeBusy = false; return; }
+    const raw = v.currentSrc || v.src || '';
+    const isBlob = raw.startsWith('blob:');
+    say('主播放器：' + (isBlob ? 'blob:（页面内部生成，第二个播放器通常拿不到）' : (raw.startsWith('http') ? 'http(s) 直链' : (raw ? '其它（' + raw.slice(0, 24) + '…）' : '地址为空'))));
+    say('  时长 ' + (isFinite(v.duration) && v.duration > 0 ? v.duration.toFixed(1) + ' 秒' : '未知（可能是直播）') +
+        ' · readyState=' + v.readyState + ' · ' + (v.paused ? '暂停' : '播放中') + ' · 静音=' + (v.muted || v.volume === 0));
+    const canCapture = !!(v.captureStream || v.mozCaptureStream);
+    say('抓音能力：' + (canCapture ? '支持 captureStream ✓' : '不支持 ✗（需 Chrome / Edge）'));
+    if (!canCapture) { say(''); say('结论：这个浏览器不支持音频桥，影子播放器方案无从谈起。'); probeBusy = false; return; }
+
+    say('');
+    say('① 测主播放器的声音（3 秒）…');
+    const m = await measureStream(v, 3000);
+    say('   主播放器 ' + (m.ok ? '有声音 ✓' : '几乎无声 ✗') + '  RMS=' + m.rms.toFixed(4) + (m.reason ? '  ' + m.reason : ''));
+    if (!m.ok) {
+      say('');
+      say('结论：这个播放器本身抓不到声音（跨域 / DRM 保护），影子播放器也一样抓不到。');
+      say('建议：改用「粘贴视频链接」模式（让服务端自己取流），或换一个网站再测。');
+      probeBusy = false; return;
+    }
+
+    say('');
+    say('② 尝试在页面内克隆一个静音播放器（同源同地址）…');
+    const pv = document.createElement('video');
+    pv.muted = true; pv.volume = 0; pv.playsInline = true; pv.preload = 'auto';
+    pv.setAttribute('playsinline', ''); pv.setAttribute('muted', '');
+    pv.style.cssText = 'position:fixed;right:2px;bottom:2px;width:2px;height:2px;opacity:0.01;pointer-events:none;z-index:0';
+    if (v.crossOrigin) pv.crossOrigin = v.crossOrigin;
+    try { pv.src = raw; } catch (e) { say('   ✗ 无法设置地址：' + (e.message || e)); }
+    document.body.appendChild(pv);
+    const log = [];
+    ['loadedmetadata', 'canplay', 'playing', 'seeked', 'waiting', 'stalled', 'error'].forEach(k => pv.addEventListener(k, () => log.push(k)));
+    try { pv.load(); } catch (e) { }
+    const gotMeta = await waitFor(() => pv.readyState >= 1 || pv.error, 6000);
+    if (!gotMeta) {
+      say('   ✗ 第二个播放器 6 秒内没有加载出任何东西（该网站多半用 blob:/MSE 喂数据）');
+      say('   事件：' + (log.join(', ') || '（无）'));
+      say('');
+      say('结论：这个网站起不了影子播放器。');
+      say('建议：改用「粘贴视频链接」模式（服务端用 yt-dlp 取流自己做前瞻）——这条对大多数主流站点有效。');
+      try { pv.src = ''; pv.remove(); } catch (e) { }
+      probeBusy = false; return;
+    }
+    if (pv.error) {
+      say('   ✗ 第二个播放器报错：code=' + pv.error.code + ' ' + (pv.error.message || ''));
+      say('');
+      say('结论：这个网站不允许同一地址被第二个播放器加载（常见于 blob:/带鉴权的地址）。');
+      say('建议：改用「粘贴视频链接」模式。');
+      try { pv.src = ''; pv.remove(); } catch (e) { }
+      probeBusy = false; return;
+    }
+    say('   元数据加载成功 ✓（时长 ' + (isFinite(pv.duration) && pv.duration > 0 ? pv.duration.toFixed(1) + ' 秒' : '未知') + '）');
+    const seekable = pv.seekable && pv.seekable.length ? pv.seekable.end(pv.seekable.length - 1) : 0;
+    say('   可跳转范围：' + (seekable ? '0 → ' + seekable.toFixed(1) + ' 秒' : '不可跳转（直播/流式）'));
+    if (!seekable) {
+      say('');
+      say('结论：这个内容不能被跳到"未来"，影子播放器无从提前。');
+      say('（如果你看的是真直播，这是正常的：直播没有未来。若你落后于直播边缘，也仍拿不到更前面的音频。）');
+      try { pv.src = ''; pv.remove(); } catch (e) { }
+      probeBusy = false; return;
+    }
+
+    const target = Math.min(seekable, (v.currentTime || 0) + LEAD);
+    say('');
+    say('③ 让它跳到 +' + LEAD + ' 秒（目标 ' + target.toFixed(1) + ' 秒）并播放…');
+    try { pv.currentTime = target; } catch (e) { say('   ✗ 跳转失败：' + (e.message || e)); }
+    const seeked = await waitFor(() => Math.abs(pv.currentTime - target) < 2 && pv.readyState >= 2, 8000);
+    if (!seeked) {
+      say('   ✗ 跳转后没有就绪（currentTime=' + pv.currentTime.toFixed(1) + ' readyState=' + pv.readyState + '）');
+      say('   事件：' + (log.join(', ') || '（无）'));
+      say('');
+      say('结论：这个网站能起第二个播放器但跳不进去，影子播放器不可用。');
+      try { pv.src = ''; pv.remove(); } catch (e) { }
+      probeBusy = false; return;
+    }
+    try { await pv.play(); } catch (e) { say('   ⚠ 自动播放被拦：' + (e.message || e)); }
+    const t0 = pv.currentTime;
+    const moving = await waitFor(() => !pv.paused && pv.currentTime > t0 + 0.6, 5000);
+    say('   ' + (moving ? '正在播放 ✓' : '未能播放 ✗（可能被站点/浏览器拦下）') + '  currentTime=' + pv.currentTime.toFixed(1));
+    say('');
+    say('④ 测第二个播放器的声音（4 秒，静音播放，你不会听到）…');
+    const m2 = await measureStream(pv, 4000);
+    say('   影子播放器 ' + (m2.ok ? '有声音 ✓' : '几乎无声 ✗') + '  RMS=' + m2.rms.toFixed(4) + (m2.reason ? '  ' + m2.reason : ''));
+    try { pv.pause(); pv.src = ''; pv.remove(); } catch (e) { }
+
+    say('');
+    say('事件轨迹：' + (log.join(', ') || '（无）'));
+    say('');
+    if (moving && m2.ok) {
+      say('结论：✓ 这个网站可以用影子播放器做前瞻。');
+      say('预期效果：识别拿到比播放领先约 ' + LEAD + ' 秒的声音，断句能像导入字幕一样自然，字幕也能按进度对齐显示。');
+      say('代价：这个页面会同时拉两路流（流量约翻倍），部分站点可能把进度写进观看历史。');
+    } else if (moving && !m2.ok) {
+      say('结论：这个网站能提前播放，但第二个播放器的声音抓不到（站点对第二路做了限制）。');
+      say('建议：改用「粘贴视频链接」模式。');
+    } else {
+      say('结论：这个网站起不了会播放的影子播放器，方案不适用。');
+      say('建议：改用「粘贴视频链接」模式。');
+    }
+    probeBusy = false;
   }
 
   // ---------------------------------------------------------------- 启动
