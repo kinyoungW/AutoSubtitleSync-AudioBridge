@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoSubtitleSync · Browser Audio Bridge
 // @namespace    autosubtitlesync.local
-// @version      3.0.0
+// @version      3.0.1
 // @description  把正在播放的声音送给你自己电脑上的 AutoSubtitleSync 做实时字幕。三种抓音方式：播放器元素 / 共享标签页音频 / 系统声音；支持跨框架 & 影子播放器探测
 // @author       AutoSubtitleSync
 // @match        *://*/*
@@ -56,7 +56,13 @@
         GM_xmlhttpRequest({
           method: method, url: url, data: body, timeout: timeout || 4000,
           headers: body ? { 'Content-Type': 'application/json' } : {},
-          onload: function (r) { try { resolve(JSON.parse(r.responseText || '{}')); } catch (e) { reject(new Error('返回内容无法解析')); } },
+          onload: function (r) {
+            try { resolve(JSON.parse(r.responseText || '{}')); }
+            catch (e) {
+              var snip = String(r.responseText || '').replace(/\s+/g, ' ').slice(0, 90);
+              reject(new Error('本机服务返回了无法解析的内容（HTTP ' + (r.status || '?') + '）：' + snip));
+            }
+          },
           onerror: function () { reject(new Error('无法连接本机服务')); },
           ontimeout: function () { reject(new Error('连接本机服务超时')); }
         });
@@ -69,17 +75,31 @@
   }
 
   async function findServer() {
-    if (server) {
+    if (server && /^8\./.test(String(server.version || ''))) {
       try { await req('GET', 'http://127.0.0.1:' + server.port + '/api/companion/ping', null, 1200); return server; }
       catch (e) { server = null; }
+    } else if (server) {
+      server = null;                       // 缓存到的是旧版本程序，重新扫描
     }
-    for (var i = 0; i < PORTS.length; i++) {
-      try {
-        var x = await req('GET', 'http://127.0.0.1:' + PORTS[i] + '/api/companion/ping', null, 700);
-        if (x && x.app === 'AutoSubtitleSync') { server = { port: PORTS[i] }; return server; }
-      } catch (e) { /* 端口空闲 */ }
+    // 并行探测端口范围；如果有多个程序在跑（新旧同时开着），优先选版本最新的那个
+    var probed = await Promise.all(PORTS.map(function (p) {
+      return req('GET', 'http://127.0.0.1:' + p + '/api/companion/ping', null, 900)
+        .then(function (x) { return (x && x.app === 'AutoSubtitleSync') ? { port: p, version: String(x.version || '') } : null; })
+        .catch(function () { return null; });
+    }));
+    var list = probed.filter(function (x) { return !!x; });
+    if (!list.length) return null;
+    list.sort(function (a, b) {
+      var va = parseFloat(a.version || '0') || 0, vb = parseFloat(b.version || '0') || 0;
+      if (vb !== va) return vb - va;
+      return a.port - b.port;
+    });
+    server = list[0];
+    if (list.length > 1) {
+      setToast('检测到多个本机程序（' + list.map(function (x) { return 'v' + x.version + '@' + x.port; }).join('、') +
+               '），已选用最新版 v' + server.version);
     }
-    return null;
+    return server;
   }
 
   function mainVideo() {
@@ -359,11 +379,18 @@
       setToast('已开始（' + sourceLabel + '）：几秒后开始逐句出字幕。');
       postStatus();
     } catch (e) {
-      setToast(e.message || String(e));
+      var m = e.message || String(e);
+      var sv = (server && server.version) ? String(server.version) : '';
+      if (sv && !/^8\./.test(sv)) {
+        m += '\n（你电脑上跑的是旧版本程序 v' + sv + '，它没有音频桥接口。请改用 v8.2 文件夹里的「AutoSubtitleSync.command」重新启动。）';
+      } else if (sv) {
+        m += '\n（本机程序版本 v' + sv + '）';
+      }
+      setToast(m);
       try { teardownPipeline(); } catch (e2) { }
       running = false; displayOnly = false;
-      pushReport('✗ ' + (e.message || String(e)));
-      if (commandedByTop) post({ kind: 'status', running: false, text: (e.message || String(e)), cues: 0 });
+      pushReport('✗ ' + m);
+      if (commandedByTop) post({ kind: 'status', running: false, text: m, cues: 0 });
     } finally { starting = false; refreshPanel(); }
   }
 
@@ -762,9 +789,10 @@
     if (!running) {
       var framesWithVideo = 0;
       frameRegistry.forEach(function (info) { if (info.hasVideo) framesWithVideo++; });
-      if (mainVideo()) targetEl.textContent = '本页找到播放器，可直接用「播放器元素」抓音。';
-      else if (framesWithVideo) targetEl.textContent = '检测到播放器在子框架里（' + framesWithVideo + ' 个），开始时会自动交给那边抓音。';
-      else targetEl.textContent = '还没检测到播放器。视频要真的在播；找不到就用「共享标签页音频」。';
+      var ver = (server && server.version) ? ('本机程序 v' + server.version + '。') : '';
+      if (mainVideo()) targetEl.textContent = ver + '本页找到播放器，可直接用「播放器元素」抓音。';
+      else if (framesWithVideo) targetEl.textContent = ver + '检测到播放器在子框架里（' + framesWithVideo + ' 个），开始时会自动交给那边抓音。';
+      else targetEl.textContent = ver + '还没检测到播放器。视频要真的在播；找不到就用「共享标签页音频」。';
     }
   }
 
